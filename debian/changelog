@@ -1,3 +1,9 @@
+qemu-server (6.4-1rpve1) pve; urgency=medium
+
+  * Fake man pages
+
+ -- Tim <tim.j.wilkinson@gmail.com>  Wed, 05 May 2021 18:36:34 -0700
+
 qemu-server (6.4-1) pve; urgency=medium
 
   * fix the +pveN versioned machine types when PXE is used

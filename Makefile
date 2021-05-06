@@ -117,3 +117,6 @@ clean:
 
 .PHONY: distclean
 distclean: clean
+
+qm.1 qmrestore.1 qm.conf.5 cpu-models.conf.5:
+	echo "fake" > $@

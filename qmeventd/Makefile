@@ -30,3 +30,6 @@ install: qmeventd docs
 clean:
 	$(MAKE) cleanup-docgen
 	rm -rf qmeventd
+
+qmeventd.8:
+	echo "fake" > $@
