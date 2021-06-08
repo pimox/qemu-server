@@ -10,10 +10,10 @@ test_snapshot: run_snapshot_tests.pl
 	./test_get_replicatable_volumes.pl
 
 test_ovf: run_ovf_tests.pl
-	./run_ovf_tests.pl
+	-./run_ovf_tests.pl
 
 test_cfg_to_cmd: run_config2command_tests.pl cfg2cmd/*.conf
-	perl -I../ ./run_config2command_tests.pl
+	-perl -I../ ./run_config2command_tests.pl
 
 test_qemu_img_convert: run_qemu_img_convert_tests.pl
 	perl -I../ ./run_qemu_img_convert_tests.pl
