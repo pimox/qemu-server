@@ -244,6 +244,10 @@ sub print_pci_addr {
 	die "aarch64/virt cannot use IDE devices\n" if $id =~ /^ide/;
 	$busname = 'pcie';
     }
+    if ($arch eq 'arm' && $machine =~ /^virt/) {
+	die "arm/virt cannot use IDE devices\n" if $id =~ /^ide/;
+	$busname = 'pcie';
+    }
 
     my $map = get_pci_addr_map();
     if (my $d = $get_addr_mapping_from_id->($map, $id)) {

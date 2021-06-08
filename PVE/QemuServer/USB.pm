@@ -39,7 +39,7 @@ sub get_usb_controllers {
     my $devices = [];
     my $pciaddr = "";
 
-    if ($arch eq 'aarch64') {
+    if ($arch eq 'aarch64' || $arch eq 'arm') {
         $pciaddr = print_pci_addr('ehci', $bridges, $arch, $machine);
         push @$devices, '-device', "usb-ehci,id=ehci$pciaddr";
     } elsif ($machine !~ /q35/) { # FIXME: combine this and machine_type_is_q35

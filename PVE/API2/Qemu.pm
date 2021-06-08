@@ -716,7 +716,7 @@ __PACKAGE__->register_method({
 			$conf->{smbios1} = PVE::QemuServer::generate_smbios1_uuid();
 		    }
 
-		    if ((!defined($conf->{vmgenid}) || $conf->{vmgenid} eq '1') && $arch ne 'aarch64') {
+		    if ((!defined($conf->{vmgenid}) || $conf->{vmgenid} eq '1') && ($arch ne 'aarch64' && $arch ne 'arm')) {
 			$conf->{vmgenid} = PVE::QemuServer::generate_uuid();
 		    }
 

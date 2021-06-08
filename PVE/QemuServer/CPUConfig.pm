@@ -456,7 +456,10 @@ sub get_cpu_options {
 
     my $cputype = $kvm ? "kvm64" : "qemu64";
     if ($arch eq 'aarch64') {
-	$cputype = 'cortex-a57';
+	$cputype = $kvm ? 'host' : 'cortex-a57';
+    }
+    if ($arch eq 'arm') {
+	$cputype = $kvm ? 'host,aarch64=off' : 'cortex-a15';
     }
 
     my $cpu = {};
@@ -519,7 +522,7 @@ sub get_cpu_options {
 	$pve_forced_flags->{'vendor'} = {
 	    value => $cpu_vendor,
 	} if $cpu_vendor ne 'default';
-    } elsif ($arch ne 'aarch64') {
+    } elsif ($arch ne 'aarch64' && $arch ne 'arm') {
 	die "internal error"; # should not happen
     }
 
