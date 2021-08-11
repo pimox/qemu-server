@@ -2,7 +2,7 @@ Source: qemu-server
 Section: admin
 Priority: optional
 Maintainer: Proxmox Support Team <support@proxmox.com>
-Build-Depends: debhelper (>= 11~),
+Build-Depends: debhelper (>= 12~),
                libio-multiplex-perl,
                libjson-c-dev,
                libpve-cluster-perl,
@@ -21,7 +21,7 @@ Build-Depends: debhelper (>= 11~),
                pve-firewall,
                pve-qemu-kvm,
                libglib2.0-dev,
-Standards-Version: 4.3.0
+Standards-Version: 4.5.1
 Homepage: https://www.proxmox.com
 
 Package: qemu-server
@@ -34,7 +34,7 @@ Depends: dbus,
          libnet-ssleay-perl,
          libpve-access-control (>= 5.0-7),
          libpve-cluster-perl,
-         libpve-common-perl (>= 6.3-3),
+         libpve-common-perl (>= 7.0-3),
          libpve-guest-common-perl (>= 3.1-3),
          libpve-storage-perl (>= 6.3-8),
          libterm-readline-gnu-perl,

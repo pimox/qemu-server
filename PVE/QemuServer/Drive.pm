@@ -12,6 +12,7 @@ our @EXPORT_OK = qw(
 is_valid_drivename
 drive_is_cloudinit
 drive_is_cdrom
+drive_is_read_only
 parse_drive
 print_drive
 );
@@ -116,7 +117,7 @@ my %drivedesc_base = (
     },
     aio => {
 	type => 'string',
-	enum => [qw(native threads)],
+	enum => [qw(native threads io_uring)],
 	description => 'AIO type to use.',
 	optional => 1,
     },
@@ -422,6 +423,15 @@ sub drive_is_cdrom {
     return $drive && $drive->{media} && ($drive->{media} eq 'cdrom');
 }
 
+sub drive_is_read_only {
+    my ($conf, $drive) = @_;
+
+    return 0 if !PVE::QemuConfig->is_template($conf);
+
+    # don't support being marked read-only
+    return $drive->{interface} ne 'sata' && $drive->{interface} ne 'ide';
+}
+
 # ideX = [volume=]volume-id[,media=d][,cyls=c,heads=h,secs=s[,trans=t]]
 #        [,snapshot=on|off][,cache=on|off][,format=f][,backup=yes|no]
 #        [,rerror=ignore|report|stop][,werror=enospc|ignore|report|stop]
@@ -531,20 +541,18 @@ sub bootdisk_size {
 
     my $bootdisks = get_bootdisks($conf);
     return if !@$bootdisks;
-    my $bootdisk = $bootdisks->[0];
-    return if !is_valid_drivename($bootdisk);
+    for my $bootdisk (@$bootdisks) {
+	next if !is_valid_drivename($bootdisk);
+	next if !$conf->{$bootdisk};
+	my $drive = parse_drive($bootdisk, $conf->{$bootdisk});
+	next if !defined($drive);
+	next if drive_is_cdrom($drive);
+	my $volid = $drive->{file};
+	next if !$volid;
+	return $drive->{size};
+    }
 
-    return if !$conf->{$bootdisk};
-
-    my $drive = parse_drive($bootdisk, $conf->{$bootdisk});
-    return if !defined($drive);
-
-    return if drive_is_cdrom($drive);
-
-    my $volid = $drive->{file};
-    return if !$volid;
-
-    return $drive->{size};
+    return;
 }
 
 sub update_disksize {

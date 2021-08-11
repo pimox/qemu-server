@@ -1,3 +1,143 @@
+qemu-server (7.0-13) bullseye; urgency=medium
+
+  * fix bootorder regression with implicit default order
+
+ -- Proxmox Support Team <support@proxmox.com>  Thu, 5 Aug 2021 14:03:14 +0200
+
+qemu-server (7.0-12) bullseye; urgency=medium
+
+  * fix #3371: import ovf: allow the use of dots in the VM name
+
+  * bootorder: fix double entry on cdrom edit
+
+ -- Proxmox Support Team <support@proxmox.com>  Fri, 30 Jul 2021 16:53:44 +0200
+
+qemu-server (7.0-11) bullseye; urgency=medium
+
+  * nic: support the intel e1000e model
+
+  * lvm: avoid the use of io_uring for now
+
+  * live-restore: fail early if target storage doesn't exist
+
+  * api: always add new CD drives to bootorder
+
+  * fix #2563: allow live migration with local cloud-init disk
+
+ -- Proxmox Support Team <support@proxmox.com>  Fri, 23 Jul 2021 11:08:48 +0200
+
+qemu-server (7.0-10) bullseye; urgency=medium
+
+  * avoid using io_uring for drives backed by LVM and configured for write-back
+    or write-through cache
+
+ -- Proxmox Support Team <support@proxmox.com>  Wed, 07 Jul 2021 14:56:34 +0200
+
+qemu-server (7.0-9) bullseye; urgency=medium
+
+  * cpu weight: always clamp value to lower maximum for cgroup v2 and fix
+    defaults (v1 -> 1024, v2 -> 100)
+
+  * api: improve error handling when applying pending config changes
+
+ -- Proxmox Support Team <support@proxmox.com>  Wed, 07 Jul 2021 12:02:13 +0200
+
+qemu-server (7.0-7) bullseye; urgency=medium
+
+  * improve #3329: ensure write-back is used over write-around for EFI disk,
+    as OVMF profits a lot from cached writes due to its frequent
+    read-modify-write operations
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 05 Jul 2021 20:49:50 +0200
+
+qemu-server (7.0-6) bullseye; urgency=medium
+
+  * live-restore: preload efidisk before starting VM
+
+  * For now do not use io_uring for drives backed by Ceph RBD, with KRBD and
+    write-back or write-through cache enabled, as in that case some polling/IO
+    may hang in QEMU 6.0.
+
+ -- Proxmox Support Team <support@proxmox.com>  Fri, 02 Jul 2021 09:45:06 +0200
+
+qemu-server (7.0-5) bullseye; urgency=medium
+
+  * don't default to O_DIRECT (cache=none) on btrfs without nocow
+
+  * fix #2175: api: update VM: check old drive-config for permissions too to
+    ensure a valid transition when limited to CDROM changes.
+
+ -- Proxmox Support Team <support@proxmox.com>  Thu, 24 Jun 2021 18:58:19 +0200
+
+qemu-server (7.0-4) bullseye; urgency=medium
+
+  * enable io-uring support by default when running QEMU 6.0 or newer
+
+  * VM start: always check if storages of volumes support correct content-type
+
+  * use KillMode 'process' for systemd scope to cope with depreacation of
+    KillMode=none
+
+  * cli, api: handle new warnings task status
+
+  * improve backup of templates with EFI disks and with SATA and IDE
+    disk controllers in use
+
+ -- Proxmox Support Team <support@proxmox.com>  Wed, 23 Jun 2021 12:57:27 +0200
+
+qemu-server (7.0-3) bullseye; urgency=medium
+
+  * vzdump: add master key support
+
+  * vzdump: drop legacy fallback logging for dirty-bitmap
+
+  * vm destroy: do not remove unreferenced disks by default
+
+  * fix #3329: turn on cache=writeback for efidisks on rbd
+
+  * avoid setting LUN number for drives when the `pvscsi` controller is used,
+    as that cannot handle multiple LUNs, increase the `scsi-id` instead
+
+  * config: limit description/comment length to 8 KiB
+
+  * migrate: enforce that image content type is available and configured on
+    target storage
+
+ -- Proxmox Support Team <support@proxmox.com>  Mon, 21 Jun 2021 11:17:52 +0200
+
+qemu-server (7.0-2) bullseye; urgency=medium
+
+  * api: clone: sort vm disks to keep numbers consistent
+
+  * api: VM status: make template property optional in return object
+
+  * add compatibility for QEMU 6.0
+
+  * destroy VM: always remove (referenced) VM state volumes
+
+  * destroy VM: also check if unused volumes are base images
+
+  * live-restore: log more similar to regular restore, outputting the user the
+    PBS repo/snapshot and target for each drive.
+
+ -- Proxmox Support Team <support@proxmox.com>  Fri, 28 May 2021 12:46:36 +0200
+
+qemu-server (7.0-1) pve; urgency=medium
+
+  * re-build for Proxmox VE 7 / Debian Bullseye
+
+ -- Proxmox Support Team <support@proxmox.com>  Thu, 13 May 2021 19:11:18 +0200
+
+qemu-server (6.4-2) pve; urgency=medium
+
+  * fix #2862: allow sata/ide template backups
+
+  * migration: improve speed-limits for >1G connections again
+
+  * fix getting bootdisk size for new bootorder config scheme
+
+ -- Proxmox Support Team <support@proxmox.com>  Thu, 29 Apr 2021 16:16:04 +0200
+
 qemu-server (6.4-1rpve2) pve; urgency=medium
 
   * ARM support

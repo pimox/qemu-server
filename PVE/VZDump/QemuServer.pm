@@ -329,7 +329,6 @@ my $query_backup_status_loop = sub {
 	}
     }
 
-    my $first_round = 1;
     my $last_finishing = 0;
     while(1) {
 	my $status = mon_cmd($vmid, 'query-backup');
@@ -361,11 +360,6 @@ my $query_backup_status_loop = sub {
 	my $mbps_write = $get_mbps->($wbytes, $timediff);
 	my $target_h = render_bytes($target, 1);
 	my $transferred_h = render_bytes($transferred, 1);
-
-	if (!$has_query_bitmap && $first_round && $target != $total) { # FIXME: remove with PVE 7.0
-	    my $total_h = render_bytes($total, 1);
-	    $self->loginfo("using fast incremental mode (dirty-bitmap), $target_h dirty of $total_h total");
-	}
 
 	my $statusline = sprintf("%3d%% ($transferred_h of $target_h) in %s"
 	    .", read: $mbps_read, write: $mbps_write", $percent, render_duration($duration));
@@ -401,7 +395,6 @@ my $query_backup_status_loop = sub {
 	    $last_finishing = $status->{finishing};
 	}
 	sleep(1);
-	$first_round = 0 if $first_round;
     }
 
     my $duration = time() - $starttime;
@@ -447,6 +440,7 @@ sub archive_pbs {
     my $repo = PVE::PBSClient::get_repository($scfg);
     my $password = PVE::Storage::PBSPlugin::pbs_get_password($scfg, $opts->{storage});
     my $keyfile = PVE::Storage::PBSPlugin::pbs_encryption_key_file_name($scfg, $opts->{storage});
+    my $master_keyfile = PVE::Storage::PBSPlugin::pbs_master_pubkey_file_name($scfg, $opts->{storage});
 
     my $diskcount = scalar(@{$task->{disks}});
     # proxmox-backup-client can only handle raw files and block devs
@@ -501,6 +495,12 @@ sub archive_pbs {
 	    }
 	}
 
+	if (!defined($qemu_support->{"pbs-masterkey"}) && -e $master_keyfile) {
+	    $self->loginfo("WARNING: backup target is configured with master key, but running QEMU version does not support master keys.");
+	    $self->loginfo("Please make sure you've installed the latest version and the VM has been restarted to use master key feature.");
+	    $master_keyfile = undef; # skip rest of master key handling below
+	}
+
 	my $fs_frozen = $self->qga_fs_freeze($task, $vmid);
 
 	my $params = {
@@ -519,7 +519,13 @@ sub archive_pbs {
 	    $self->loginfo("enabling encryption");
 	    $params->{keyfile} = $keyfile;
 	    $params->{encrypt} = JSON::true;
+	    if (defined($master_keyfile) && -e $master_keyfile) {
+		$self->loginfo("enabling master key feature");
+		$params->{"master-keyfile"} = $master_keyfile;
+	    }
 	} else {
+	    $self->loginfo("WARNING: backup target is configured with master key, but this backup is not encrypted - master key settings will be ignored!")
+		if defined($master_keyfile) && -e $master_keyfile;
 	    $params->{encrypt} = JSON::false;
 	}
 

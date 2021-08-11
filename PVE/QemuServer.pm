@@ -48,7 +48,7 @@ use PVE::QemuServer::Helpers qw(min_version config_aware_timeout);
 use PVE::QemuServer::Cloudinit;
 use PVE::QemuServer::CGroup;
 use PVE::QemuServer::CPUConfig qw(print_cpu_device get_cpu_options);
-use PVE::QemuServer::Drive qw(is_valid_drivename drive_is_cloudinit drive_is_cdrom parse_drive print_drive);
+use PVE::QemuServer::Drive qw(is_valid_drivename drive_is_cloudinit drive_is_cdrom drive_is_read_only parse_drive print_drive);
 use PVE::QemuServer::Machine;
 use PVE::QemuServer::Memory;
 use PVE::QemuServer::Monitor qw(mon_cmd);
@@ -319,11 +319,13 @@ my $confdesc = {
     cpuunits => {
 	optional => 1,
 	type => 'integer',
-        description => "CPU weight for a VM.",
-	verbose_description => "CPU weight for a VM. Argument is used in the kernel fair scheduler. The larger the number is, the more CPU time this VM gets. Number is relative to weights of all the other running VMs.",
+        description => "CPU weight for a VM, will be clamped to [1, 10000] in cgroup v2.",
+	verbose_description => "CPU weight for a VM. Argument is used in the kernel fair scheduler."
+	    ." The larger the number is, the more CPU time this VM gets. Number is relative to"
+	    ." weights of all the other running VMs.",
 	minimum => 2,
 	maximum => 262144,
-	default => 1024,
+	default => 'cgroup v1: 1024, cgroup v2: 100',
     },
     memory => {
 	optional => 1,
@@ -369,7 +371,9 @@ my $confdesc = {
     description => {
 	optional => 1,
 	type => 'string',
-	description => "Description for the VM. Only used on the configuration web interface. This is saved as comment inside the configuration file.",
+	description => "Description for the VM. Shown in the web-interface VM's summary."
+	    ." This is saved as comment inside the configuration file.",
+	maxLength => 1024 * 8,
     },
     ostype => {
 	optional => 1,
@@ -832,9 +836,22 @@ for (my $i = 0; $i < $MAX_NUMA; $i++)  {
     $confdesc->{"numa$i"} = $numadesc;
 }
 
-my $nic_model_list = ['rtl8139', 'ne2k_pci', 'e1000',  'pcnet',  'virtio',
-		      'ne2k_isa', 'i82551', 'i82557b', 'i82559er', 'vmxnet3',
-		      'e1000-82540em', 'e1000-82544gc', 'e1000-82545em'];
+my $nic_model_list = [
+    'e1000',
+    'e1000-82540em',
+    'e1000-82544gc',
+    'e1000-82545em',
+    'e1000e',
+    'i82551',
+    'i82557b',
+    'i82559er',
+    'ne2k_isa',
+    'ne2k_pci',
+    'pcnet',
+    'rtl8139',
+    'virtio',
+    'vmxnet3',
+];
 my $nic_model_list_txt = join(' ', sort @$nic_model_list);
 
 my $net_fmt_bridge_descr = <<__EOD__;
@@ -1455,7 +1472,7 @@ sub print_drivedevice_full {
 	    }
 	}
 
-	if (!$conf->{scsihw} || ($conf->{scsihw} =~ m/^lsi/)){
+	if (!$conf->{scsihw} || $conf->{scsihw} =~ m/^lsi/ || $conf->{scsihw} eq 'pvscsi') {
 	    $device = "scsi-$devicetype,bus=$controller_prefix$controller.0,scsi-id=$unit";
 	} else {
 	    $device = "scsi-$devicetype,bus=$controller_prefix$controller.0,channel=0,scsi-id=0"
@@ -1525,21 +1542,22 @@ sub get_initiator_name {
 }
 
 sub print_drive_commandline_full {
-    my ($storecfg, $vmid, $drive, $pbs_name) = @_;
+    my ($storecfg, $vmid, $drive, $pbs_name, $io_uring) = @_;
 
     my $path;
     my $volid = $drive->{file};
     my $format = $drive->{format};
     my $drive_id = get_drive_id($drive);
 
+    my ($storeid, $volname) = PVE::Storage::parse_volume_id($volid, 1);
+    my $scfg = $storeid ? PVE::Storage::storage_config($storecfg, $storeid) : undef;
+
     if (drive_is_cdrom($drive)) {
 	$path = get_iso_path($storecfg, $vmid, $volid);
         die "$drive_id: cannot back cdrom drive with PBS snapshot\n" if $pbs_name;
     } else {
-	my ($storeid, $volname) = PVE::Storage::parse_volume_id($volid, 1);
 	if ($storeid) {
 	    $path = PVE::Storage::path($storecfg, $volid);
-	    my $scfg = PVE::Storage::storage_config($storecfg, $storeid);
 	    $format //= qemu_img_format($scfg, $volname);
 	} else {
 	    $path = $volid;
@@ -1596,17 +1614,29 @@ sub print_drive_commandline_full {
 
     if (my $cache = $drive->{cache}) {
 	$cache_direct = $cache =~ /^(?:off|none|directsync)$/;
-    } elsif (!drive_is_cdrom($drive)) {
+    } elsif (!drive_is_cdrom($drive) && !($scfg && $scfg->{type} eq 'btrfs' && !$scfg->{nocow})) {
 	$opts .= ",cache=none";
 	$cache_direct = 1;
     }
 
-    # aio native works only with O_DIRECT
+    # io_uring with cache mode writeback or writethrough on krbd will hang...
+    my $rbd_no_io_uring = $scfg && $scfg->{type} eq 'rbd' && $scfg->{krbd} && !$cache_direct;
+
+    # io_uring with cache mode writeback or writethrough on LVM will hang, without cache only
+    # sometimes, just plain disable...
+    my $lvm_no_io_uring = $scfg && $scfg->{type} eq 'lvm';
+
     if (!$drive->{aio}) {
-	if($cache_direct) {
-	    $opts .= ",aio=native";
+	if ($io_uring && !$rbd_no_io_uring && !$lvm_no_io_uring) {
+	    # io_uring supports all cache modes
+	    $opts .= ",aio=io_uring";
 	} else {
-	    $opts .= ",aio=threads";
+	    # aio native works only with O_DIRECT
+	    if($cache_direct) {
+		$opts .= ",aio=native";
+	    } else {
+		$opts .= ",aio=threads";
+	    }
 	}
     }
 
@@ -1695,6 +1725,8 @@ sub print_netdevice_full {
 	    $romfile = 'pxe-virtio.rom';
 	} elsif ($device eq 'e1000') {
 	    $romfile = 'pxe-e1000.rom';
+	} elsif ($device eq 'e1000e') {
+	    $romfile = 'pxe-e1000e.rom';
 	} elsif ($device eq 'ne2k') {
 	    $romfile = 'pxe-ne2k_pci.rom';
 	} elsif ($device eq 'pcnet') {
@@ -2131,7 +2163,7 @@ sub destroy_vm {
 
     if ($conf->{template}) {
 	# check if any base image is still used by a linked clone
-	PVE::QemuConfig->foreach_volume($conf, sub {
+	PVE::QemuConfig->foreach_volume_full($conf, { include_unused => 1 }, sub {
 		my ($ds, $drive) = @_;
 		return if drive_is_cdrom($drive);
 
@@ -2144,8 +2176,7 @@ sub destroy_vm {
 	});
     }
 
-    # only remove disks owned by this VM (referenced in the config)
-    PVE::QemuConfig->foreach_volume_full($conf, { include_unused => 1 }, sub {
+    my $remove_owned_drive = sub {
 	my ($ds, $drive) = @_;
  	return if drive_is_cdrom($drive, 1);
 
@@ -2157,7 +2188,21 @@ sub destroy_vm {
 
 	eval { PVE::Storage::vdisk_free($storecfg, $volid) };
 	warn "Could not remove disk '$volid', check manually: $@" if $@;
-    });
+    };
+
+    # only remove disks owned by this VM (referenced in the config)
+    my $include_opts = {
+	include_unused => 1,
+	extra_keys => ['vmstate'],
+    };
+    PVE::QemuConfig->foreach_volume_full($conf, $include_opts, $remove_owned_drive);
+
+    for my $snap (values %{$conf->{snapshots}}) {
+	next if !defined($snap->{vmstate});
+	my $drive = PVE::QemuConfig->parse_volume('vmstate', $snap->{vmstate}, 1);
+	next if !defined($drive);
+	$remove_owned_drive->('vmstate', $drive);
+    }
 
     if ($purge_unreferenced) { # also remove unreferenced disk
 	my $vmdisks = PVE::Storage::vdisk_list($storecfg, undef, $vmid, undef, 'images');
@@ -2447,8 +2492,13 @@ sub check_storage_availability {
 	return if !$sid;
 
 	# check if storage is available on both nodes
-	my $scfg = PVE::Storage::storage_check_node($storecfg, $sid);
-	PVE::Storage::storage_check_node($storecfg, $sid, $node);
+	my $scfg = PVE::Storage::storage_check_enabled($storecfg, $sid);
+	PVE::Storage::storage_check_enabled($storecfg, $sid, $node);
+
+	my ($vtype) = PVE::Storage::parse_volname($storecfg, $volid);
+
+	die "$volid: content type '$vtype' is not available on storage '$sid'\n"
+	    if !$scfg->{content}->{$vtype};
    });
 }
 
@@ -2642,8 +2692,8 @@ sub vmstatus {
 
 	my $conf = PVE::QemuConfig->load_config($vmid);
 
-	my $d = { vmid => $vmid };
-	$d->{pid} = $list->{$vmid}->{pid};
+	my $d = { vmid => int($vmid) };
+	$d->{pid} = int($list->{$vmid}->{pid}) if $list->{$vmid}->{pid};
 
 	# fixme: better status?
 	$d->{status} = $list->{$vmid}->{pid} ? 'running' : 'stopped';
@@ -2682,7 +2732,7 @@ sub vmstatus {
 	$d->{diskread} = 0;
 	$d->{diskwrite} = 0;
 
-        $d->{template} = PVE::QemuConfig->is_template($conf);
+        $d->{template} = 1 if PVE::QemuConfig->is_template($conf);
 
 	$d->{serial} = 1 if conf_has_serial($conf);
 	$d->{lock} = $conf->{lock} if $conf->{lock};
@@ -2702,8 +2752,8 @@ sub vmstatus {
 	$d->{netin} += $netdev->{$dev}->{transmit};
 
 	if ($full) {
-	    $d->{nics}->{$dev}->{netout} = $netdev->{$dev}->{receive};
-	    $d->{nics}->{$dev}->{netin} = $netdev->{$dev}->{transmit};
+	    $d->{nics}->{$dev}->{netout} = int($netdev->{$dev}->{receive});
+	    $d->{nics}->{$dev}->{netin} = int($netdev->{$dev}->{transmit});
 	}
 
     }
@@ -3075,7 +3125,7 @@ sub query_supported_cpu_flags {
 	    $qemu_cmd,
 	    '-machine', $default_machine,
 	    '-display', 'none',
-	    '-chardev', "socket,id=qmp,path=/var/run/qemu-server/$fakevmid.qmp,server,nowait",
+	    '-chardev', "socket,id=qmp,path=/var/run/qemu-server/$fakevmid.qmp,server=on,wait=off",
 	    '-mon', 'chardev=qmp,mode=control',
 	    '-pidfile', $pidfile,
 	    '-S', '-daemonize'
@@ -3147,6 +3197,10 @@ sub query_understood_cpu_flags {
     return \@flags;
 }
 
+my sub get_cpuunits {
+    my ($conf) = @_;
+    return $conf->{cpuunits} // (PVE::CGroup::cgroup_mode() == 2 ? 100 : 1024);
+}
 sub config_to_command {
     my ($storecfg, $vmid, $conf, $defaults, $forcemachine, $forcecpu,
         $pbs_backing) = @_;
@@ -3216,8 +3270,7 @@ sub config_to_command {
     my $use_old_bios_files = undef;
     ($use_old_bios_files, $machine_type) = qemu_use_old_bios_files($machine_type);
 
-    my $cpuunits = defined($conf->{cpuunits}) ?
-            $conf->{cpuunits} : $defaults->{cpuunits};
+    my $cpuunits = get_cpuunits($conf);
 
     push @$cmd, $kvm_binary;
 
@@ -3232,7 +3285,7 @@ sub config_to_command {
     my $use_virtio = 0;
 
     my $qmpsocket = PVE::QemuServer::Helpers::qmp_socket($vmid);
-    push @$cmd, '-chardev', "socket,id=qmp,path=$qmpsocket,server,nowait";
+    push @$cmd, '-chardev', "socket,id=qmp,path=$qmpsocket,server=on,wait=off";
     push @$cmd, '-mon', "chardev=qmp,mode=control";
 
     if (min_version($machine_version, 2, 12)) {
@@ -3272,6 +3325,7 @@ sub config_to_command {
 	die "uefi base image '$ovmf_code' not found\n" if ! -f $ovmf_code;
 
 	my ($path, $format);
+	my $read_only_str = '';
 	if (my $efidisk = $conf->{efidisk0}) {
 	    my $d = parse_drive('efidisk0', $efidisk);
 	    my ($storeid, $volname) = PVE::Storage::parse_volume_id($d->{file}, 1);
@@ -3287,6 +3341,8 @@ sub config_to_command {
 		die "efidisk format must be specified\n"
 		    if !defined($format);
 	    }
+
+	    $read_only_str = ',readonly=on' if drive_is_read_only($conf, $d);
 	} else {
 	    warn "no efidisk configured! Using temporary efivars disk.\n";
 	    $path = "/tmp/$vmid-ovmf.fd";
@@ -3300,8 +3356,15 @@ sub config_to_command {
 	    $size_str = ",size=" . (-s $ovmf_vars);
 	}
 
-	push @$cmd, '-drive', "if=pflash,unit=0,format=raw,readonly,file=$ovmf_code";
-	push @$cmd, '-drive', "if=pflash,unit=1,format=$format,id=drive-efidisk0$size_str,file=$path";
+	# SPI flash does lots of read-modify-write OPs, without writeback this gets really slow #3329
+	my $cache = "";
+	if ($path =~ m/^rbd:/) {
+		$cache = ',cache=writeback';
+		$path .= ':rbd_cache_policy=writeback'; # avoid write-around, we *need* to cache writes too
+	}
+
+	push @$cmd, '-drive', "if=pflash,unit=0,format=raw,readonly=on,file=$ovmf_code";
+	push @$cmd, '-drive', "if=pflash,unit=1$cache,format=$format,id=drive-efidisk0$size_str,file=${path}${read_only_str}";
     }
 
     # load q35 config
@@ -3374,7 +3437,7 @@ sub config_to_command {
 	if (my $path = $conf->{"serial$i"}) {
 	    if ($path eq 'socket') {
 		my $socket = "/var/run/qemu-server/${vmid}.serial$i";
-		push @$devices, '-chardev', "socket,id=serial$i,path=$socket,server,nowait";
+		push @$devices, '-chardev', "socket,id=serial$i,path=$socket,server=on,wait=off";
 		# On aarch64, serial0 is the UART device. Qemu only allows
 		# connecting UART devices via the '-serial' command line, as
 		# the device has a fixed slot on the hardware...
@@ -3446,7 +3509,7 @@ sub config_to_command {
 	push @$devices, '-device', print_vga_device(
 	    $conf, $vga, $arch, $machine_version, $machine_type, undef, $qxlnum, $bridges);
 	my $socket = PVE::QemuServer::Helpers::vnc_socket($vmid);
-	push @$cmd,  '-vnc', "unix:$socket,password";
+	push @$cmd,  '-vnc', "unix:$socket,password=on";
     } else {
 	push @$cmd, '-vga', 'none' if $vga->{type} eq 'none';
 	push @$cmd, '-nographic';
@@ -3494,7 +3557,7 @@ sub config_to_command {
 
     if ($guest_agent->{enabled}) {
 	my $qgasocket = PVE::QemuServer::Helpers::qmp_socket($vmid, 1);
-	push @$devices, '-chardev', "socket,path=$qgasocket,server,nowait,id=qga0";
+	push @$devices, '-chardev', "socket,path=$qgasocket,server=on,wait=off,id=qga0";
 
 	if (!$guest_agent->{type} || $guest_agent->{type} eq 'virtio') {
 	    my $pciaddr = print_pci_addr("qga0", $bridges, $arch, $machine_type);
@@ -3597,6 +3660,7 @@ sub config_to_command {
 	my ($ds, $drive) = @_;
 
 	if (PVE::Storage::parse_volume_id($drive->{file}, 1)) {
+	    check_volume_storage_type($storecfg, $drive->{file});
 	    push @$vollist, $drive->{file};
 	}
 
@@ -3654,8 +3718,11 @@ sub config_to_command {
 	    push @$devices, '-blockdev', print_pbs_blockdev($pbs_conf, $pbs_name);
 	}
 
-	my $drive_cmd = print_drive_commandline_full($storecfg, $vmid, $drive, $pbs_name);
-	$drive_cmd .= ',readonly' if PVE::QemuConfig->is_template($conf);
+	my $drive_cmd = print_drive_commandline_full(
+	    $storecfg, $vmid, $drive, $pbs_name, min_version($kvmver, 6, 0));
+
+	# extra protection for templates, but SATA and IDE don't support it..
+	$drive_cmd .= ',readonly=on' if drive_is_read_only($conf, $drive);
 
 	push @$devices, '-drive',$drive_cmd;
 	push @$devices, '-device', print_drivedevice_full(
@@ -3753,6 +3820,11 @@ sub config_to_command {
 	push @$vollist, $vmstate;
 	push @$cmd, '-loadstate', $statepath;
 	print "activating and using '$vmstate' as vmstate\n";
+    }
+
+    if (PVE::QemuConfig->is_template($conf)) {
+	# needed to workaround base volumes being read-only
+	push @$cmd, '-snapshot';
     }
 
     # add custom args
@@ -4062,7 +4134,9 @@ sub qemu_objectdel {
 sub qemu_driveadd {
     my ($storecfg, $vmid, $device) = @_;
 
-    my $drive = print_drive_commandline_full($storecfg, $vmid, $device);
+    my $kvmver = get_running_qemu_version($vmid);
+    my $io_uring = min_version($kvmver, 6, 0);
+    my $drive = print_drive_commandline_full($storecfg, $vmid, $device, undef, $io_uring);
     $drive =~ s/\\/\\\\/g;
     my $ret = PVE::QemuServer::Monitor::hmp_cmd($vmid, "drive_add auto \"$drive\"");
 
@@ -4579,7 +4653,7 @@ sub vmconfig_hotplug_pending {
 		die "skip\n" if !$hotplug_features->{memory};
 		PVE::QemuServer::Memory::qemu_memory_hotplug($vmid, $conf, $defaults, $opt);
 	    } elsif ($opt eq 'cpuunits') {
-		$cgroup->change_cpu_shares(undef, $defaults->{cpuunits});
+		$cgroup->change_cpu_shares(undef, 1024);
 	    } elsif ($opt eq 'cpulimit') {
 		$cgroup->change_cpu_quota(-1, 100000);
 	    } else {
@@ -4673,7 +4747,7 @@ sub vmconfig_hotplug_pending {
 		die "skip\n" if !$hotplug_features->{memory};
 		$value = PVE::QemuServer::Memory::qemu_memory_hotplug($vmid, $conf, $defaults, $opt, $value);
 	    } elsif ($opt eq 'cpuunits') {
-		$cgroup->change_cpu_shares($conf->{pending}->{$opt}, $defaults->{cpuunits});
+		$cgroup->change_cpu_shares($conf->{pending}->{$opt}, 1024);
 	    } elsif ($opt eq 'cpulimit') {
 		my $cpulimit = $conf->{pending}->{$opt} == 0 ? -1 : int($conf->{pending}->{$opt} * 100000);
 		$cgroup->change_cpu_quota($cpulimit, 100000);
@@ -5105,7 +5179,9 @@ sub vm_start_nolock {
 	$conf = PVE::QemuConfig->load_config($vmid); # update/reload
     }
 
-    PVE::QemuServer::Cloudinit::generate_cloudinitconfig($conf, $vmid);
+    # don't regenerate the ISO if the VM is started as part of a live migration
+    # this way we can reuse the old ISO with the correct config
+    PVE::QemuServer::Cloudinit::generate_cloudinitconfig($conf, $vmid) if !$migratedfrom;
 
     my $defaults = load_defaults();
 
@@ -5240,8 +5316,7 @@ sub vm_start_nolock {
     # timeout should be more than enough here...
     PVE::Systemd::wait_for_unit_removed("$vmid.scope", 5);
 
-    my $cpuunits = defined($conf->{cpuunits}) ? $conf->{cpuunits}
-	                                      : $defaults->{cpuunits};
+    my $cpuunits = get_cpuunits($conf);
 
     my $start_timeout = $params->{timeout} // config_aware_timeout($conf, $resume);
     my %run_params = (
@@ -5259,10 +5334,13 @@ sub vm_start_nolock {
 
     my %properties = (
 	Slice => 'qemu.slice',
-	KillMode => 'none'
+	KillMode => 'process',
+	SendSIGKILL => 0,
+	TimeoutStopUSec => ULONG_MAX, # infinity
     );
 
     if (PVE::CGroup::cgroup_mode() == 2) {
+	$cpuunits = 10000 if $cpuunits >= 10000; # else we get an error
 	$properties{CPUWeight} = $cpuunits;
     } else {
 	$properties{CPUShares} = $cpuunits;
@@ -6080,11 +6158,10 @@ my $restore_destroy_volumes = sub {
     }
 };
 
-# FIXME For PVE 7.0, remove $content_type and always use 'images'
 sub scan_volids {
-    my ($cfg, $vmid, $content_type) = @_;
+    my ($cfg, $vmid) = @_;
 
-    my $info = PVE::Storage::vdisk_list($cfg, undef, $vmid, undef, $content_type);
+    my $info = PVE::Storage::vdisk_list($cfg, undef, $vmid, undef, 'images');
 
     my $volid_hash = {};
     foreach my $storeid (keys %$info) {
@@ -6178,7 +6255,7 @@ sub rescan {
     my $cfg = PVE::Storage::config();
 
     print "rescan volumes...\n";
-    my $volid_hash = scan_volids($cfg, $vmid, 'images');
+    my $volid_hash = scan_volids($cfg, $vmid);
 
     my $updatefn =  sub {
 	my ($vmid) = @_;
@@ -6326,35 +6403,36 @@ sub restore_proxmox_backup_archive {
 	# allocate volumes
 	my $map = $restore_allocate_devices->($storecfg, $virtdev_hash, $vmid);
 
-	if (!$options->{live}) {
-	    foreach my $virtdev (sort keys %$virtdev_hash) {
-		my $d = $virtdev_hash->{$virtdev};
-		next if $d->{is_cloudinit}; # no need to restore cloudinit
+	foreach my $virtdev (sort keys %$virtdev_hash) {
+	    my $d = $virtdev_hash->{$virtdev};
+	    next if $d->{is_cloudinit}; # no need to restore cloudinit
 
-		my $volid = $d->{volid};
+	    # this fails if storage is unavailable
+	    my $volid = $d->{volid};
+	    my $path = PVE::Storage::path($storecfg, $volid);
 
-		my $path = PVE::Storage::path($storecfg, $volid);
+	    # for live-restore we only want to preload the efidisk
+	    next if $options->{live} && $virtdev ne 'efidisk0';
 
-		my $pbs_restore_cmd = [
-		    '/usr/bin/pbs-restore',
-		    '--repository', $repo,
-		    $pbs_backup_name,
-		    "$d->{devname}.img.fidx",
-		    $path,
-		    '--verbose',
-		    ];
+	    my $pbs_restore_cmd = [
+		'/usr/bin/pbs-restore',
+		'--repository', $repo,
+		$pbs_backup_name,
+		"$d->{devname}.img.fidx",
+		$path,
+		'--verbose',
+		];
 
-		push @$pbs_restore_cmd, '--format', $d->{format} if $d->{format};
-		push @$pbs_restore_cmd, '--keyfile', $keyfile if -e $keyfile;
+	    push @$pbs_restore_cmd, '--format', $d->{format} if $d->{format};
+	    push @$pbs_restore_cmd, '--keyfile', $keyfile if -e $keyfile;
 
-		if (PVE::Storage::volume_has_feature($storecfg, 'sparseinit', $volid)) {
-		    push @$pbs_restore_cmd, '--skip-zero';
-		}
-
-		my $dbg_cmdstring = PVE::Tools::cmd2string($pbs_restore_cmd);
-		print "restore proxmox backup image: $dbg_cmdstring\n";
-		run_command($pbs_restore_cmd);
+	    if (PVE::Storage::volume_has_feature($storecfg, 'sparseinit', $volid)) {
+		push @$pbs_restore_cmd, '--skip-zero';
 	    }
+
+	    my $dbg_cmdstring = PVE::Tools::cmd2string($pbs_restore_cmd);
+	    print "restore proxmox backup image: $dbg_cmdstring\n";
+	    run_command($pbs_restore_cmd);
 	}
 
 	$fh->seek(0, 0) || die "seek failed - $!\n";
@@ -6409,6 +6487,7 @@ sub restore_proxmox_backup_archive {
 	my $conf = PVE::QemuConfig->load_config($vmid);
 	die "cannot do live-restore for template\n" if PVE::QemuConfig->is_template($conf);
 
+	delete $devinfo->{'drive-efidisk0'}; # this special drive is already restored before start
 	pbs_live_restore($vmid, $conf, $storecfg, $devinfo, $repo, $keyfile, $pbs_backup_name);
 
 	PVE::QemuConfig->remove_lock($vmid, "create");
@@ -6418,17 +6497,22 @@ sub restore_proxmox_backup_archive {
 sub pbs_live_restore {
     my ($vmid, $conf, $storecfg, $restored_disks, $repo, $keyfile, $snap) = @_;
 
-    print "Starting VM for live-restore\n";
+    print "starting VM for live-restore\n";
+    print "repository: '$repo', snapshot: '$snap'\n";
 
     my $pbs_backing = {};
     for my $ds (keys %$restored_disks) {
 	$ds =~ m/^drive-(.*)$/;
-	$pbs_backing->{$1} = {
+	my $confname = $1;
+	$pbs_backing->{$confname} = {
 	    repository => $repo,
 	    snapshot => $snap,
 	    archive => "$ds.img.fidx",
 	};
-	$pbs_backing->{$1}->{keyfile} = $keyfile if -e $keyfile;
+	$pbs_backing->{$confname}->{keyfile} = $keyfile if -e $keyfile;
+
+	my $drive = parse_drive($confname, $conf->{$confname});
+	print "restoring '$ds' to '$drive->{file}'\n";
     }
 
     my $drives_streamed = 0;
@@ -7711,6 +7795,19 @@ sub vm_is_paused {
     };
     warn "$@\n" if $@;
     return $qmpstatus && $qmpstatus->{status} eq "paused";
+}
+
+sub check_volume_storage_type {
+    my ($storecfg, $vol) = @_;
+
+    my ($storeid, $volname) = PVE::Storage::parse_volume_id($vol);
+    my $scfg = PVE::Storage::storage_config($storecfg, $storeid);
+    my ($vtype) = PVE::Storage::parse_volname($storecfg, $vol);
+
+    die "storage '$storeid' does not support content-type '$vtype'\n"
+	if !$scfg->{content}->{$vtype};
+
+    return 1;
 }
 
 1;

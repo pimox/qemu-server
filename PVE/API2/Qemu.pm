@@ -1263,6 +1263,17 @@ my $update_vm_api  = sub {
 	    }
 	    my $bootorder_deleted = grep {$_ eq 'bootorder'} @delete;
 
+	    my $check_drive_perms = sub {
+		my ($opt, $val) = @_;
+		my $drive = PVE::QemuServer::parse_drive($opt, $val);
+		# FIXME: cloudinit: CDROM or Disk?
+		if (PVE::QemuServer::drive_is_cdrom($drive)) { # CDROM
+		    $rpcenv->check_vm_perm($authuser, $vmid, undef, ['VM.Config.CDROM']);
+		} else {
+		    $rpcenv->check_vm_perm($authuser, $vmid, undef, ['VM.Config.Disk']);
+		}
+	    };
+
 	    foreach my $opt (@delete) {
 		$modified->{$opt} = 1;
 		$conf = PVE::QemuConfig->load_config($vmid); # update/reload
@@ -1300,12 +1311,7 @@ my $update_vm_api  = sub {
 		    }
 		} elsif (PVE::QemuServer::is_valid_drivename($opt)) {
 		    PVE::QemuConfig->check_protection($conf, "can't remove drive '$opt'");
-		    my $drive = PVE::QemuServer::parse_drive($opt, $val);
-		    if (PVE::QemuServer::drive_is_cdrom($drive)) {
-			$rpcenv->check_vm_perm($authuser, $vmid, undef, ['VM.Config.CDROM']);
-		    } else {
-			$rpcenv->check_vm_perm($authuser, $vmid, undef, ['VM.Config.Disk']);
-		    }
+		    $check_drive_perms->($opt, $val);
 		    PVE::QemuServer::vmconfig_register_unused_drive($storecfg, $vmid, $conf, PVE::QemuServer::parse_drive($opt, $val))
 			if $is_pending_val;
 		    PVE::QemuConfig->add_to_pending_delete($conf, $opt, $force);
@@ -1340,17 +1346,28 @@ my $update_vm_api  = sub {
 		my $arch = PVE::QemuServer::get_vm_arch($conf);
 
 		if (PVE::QemuServer::is_valid_drivename($opt)) {
-		    my $drive = PVE::QemuServer::parse_drive($opt, $param->{$opt});
-		    # FIXME: cloudinit: CDROM or Disk?
-		    if (PVE::QemuServer::drive_is_cdrom($drive)) { # CDROM
-			$rpcenv->check_vm_perm($authuser, $vmid, undef, ['VM.Config.CDROM']);
-		    } else {
-			$rpcenv->check_vm_perm($authuser, $vmid, undef, ['VM.Config.Disk']);
+		    # old drive
+		    if ($conf->{$opt}) {
+			$check_drive_perms->($opt, $conf->{$opt});
 		    }
+
+		    # new drive
+		    $check_drive_perms->($opt, $param->{$opt});
 		    PVE::QemuServer::vmconfig_register_unused_drive($storecfg, $vmid, $conf, PVE::QemuServer::parse_drive($opt, $conf->{pending}->{$opt}))
 			if defined($conf->{pending}->{$opt});
 
 		    &$create_disks($rpcenv, $authuser, $conf->{pending}, $arch, $storecfg, $vmid, undef, {$opt => $param->{$opt}});
+
+		    # default legacy boot order implies all cdroms anyway
+		    if (@bootorder) {
+			# append new CD drives to bootorder to mark them bootable
+			my $drive = PVE::QemuServer::parse_drive($opt, $param->{$opt});
+			if (PVE::QemuServer::drive_is_cdrom($drive, 1) && !grep(/^$opt$/, @bootorder)) {
+			    push @bootorder, $opt;
+			    $conf->{pending}->{boot} = PVE::QemuServer::print_bootorder(\@bootorder);
+			    $modified->{boot} = 1;
+			}
+		    }
 		} elsif ($opt =~ m/^serial\d+/) {
 		    if ((!defined($conf->{$opt}) || $conf->{$opt} eq 'socket') && $param->{$opt} eq 'socket') {
 			$rpcenv->check_vm_perm($authuser, $vmid, undef, ['VM.Config.HWType']);
@@ -1407,7 +1424,7 @@ my $update_vm_api  = sub {
 	    if ($running) {
 		PVE::QemuServer::vmconfig_hotplug_pending($vmid, $conf, $storecfg, $modified, $errors);
 	    } else {
-		PVE::QemuServer::vmconfig_apply_pending($vmid, $conf, $storecfg, $running, $errors);
+		PVE::QemuServer::vmconfig_apply_pending($vmid, $conf, $storecfg, $errors);
 	    }
 	    raise_param_exc($errors) if scalar(keys %$errors);
 
@@ -1438,7 +1455,7 @@ my $update_vm_api  = sub {
 
 		if (!$running) {
 		    my $status = PVE::Tools::upid_read_status($upid);
-		    return if $status eq 'OK';
+		    return if !PVE::Tools::upid_status_is_error($status);
 		    die $status;
 		}
 	    }
@@ -1592,7 +1609,7 @@ __PACKAGE__->register_method({
 		description => "If set, destroy additionally all disks not referenced in the config"
 		 ." but with a matching VMID from all enabled storages.",
 		optional => 1,
-		default => 1, # FIXME: replace to false in PVE 7.0, this is dangerous!
+		default => 0,
 	    },
 	},
     },
@@ -1643,8 +1660,7 @@ __PACKAGE__->register_method({
 		# repeat, config might have changed
 		my $ha_managed = $early_checks->();
 
-		# FIXME: drop fallback to true with 7.0, to dangerous for default
-		my $purge_unreferenced = $param->{'destroy-unreferenced-disks'} // 1;
+		my $purge_unreferenced = $param->{'destroy-unreferenced-disks'};
 
 		PVE::QemuServer::destroy_vm(
 		    $storecfg,
@@ -3025,7 +3041,7 @@ __PACKAGE__->register_method({
 	    PVE::Storage::storage_check_enabled($storecfg, $storage);
 	    if ($target) {
 		# check if storage is available on target node
-		PVE::Storage::storage_check_node($storecfg, $storage, $target);
+		PVE::Storage::storage_check_enabled($storecfg, $storage, $target);
 		# clone only works if target storage is shared
 		my $scfg = PVE::Storage::storage_config($storecfg, $storage);
 		die "can't clone to non-shared storage '$storage'\n" if !$scfg->{shared};
@@ -3157,7 +3173,7 @@ __PACKAGE__->register_method({
 		    my $total_jobs = scalar(keys %{$drives});
 		    my $i = 1;
 
-		    foreach my $opt (keys %$drives) {
+		    foreach my $opt (sort keys %$drives) {
 			my $drive = $drives->{$opt};
 			my $skipcomplete = ($total_jobs != $i); # finish after last drive
 			my $completion = $skipcomplete ? 'skip' : 'complete';
@@ -3688,7 +3704,7 @@ __PACKAGE__->register_method({
 	if (my $targetstorage = $param->{targetstorage}) {
 	    my $check_storage = sub {
 		my ($target_sid) = @_;
-		PVE::Storage::storage_check_node($storecfg, $target_sid, $target);
+		PVE::Storage::storage_check_enabled($storecfg, $target_sid, $target);
 		$rpcenv->check($authuser, "/storage/$target_sid", ['Datastore.AllocateSpace']);
 		my $scfg = PVE::Storage::storage_config($storecfg, $target_sid);
 		raise_param_exc({ targetstorage => "storage '$target_sid' does not support vm images"})
