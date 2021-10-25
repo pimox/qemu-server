@@ -686,6 +686,15 @@ EODESCR
 	description => "Configure a VirtIO-based Random Number Generator.",
 	optional => 1,
     },
+    cpu_taskset => {
+	optional => 1,
+	type => 'string',
+	description => "CPU pinning config.",
+	verbose_description => "When specified VM will be launched with `cpuset -c {cpu_taskset} kvm ...`\n"
+	    ."No argument test is performed so please make sure the value matches VM cpu total thread count.\n"
+	    ."This is required when VM is sensitive to host context switching (e.g. gaming),"
+	    ." or when host is not SMP so VM thread could be switched to a different CPU architecture (e.g. big.LITTLE for ARM).",
+    },
 };
 
 my $cicustom_fmt = {
@@ -3218,6 +3227,10 @@ sub config_to_command {
 
     my $cpuunits = defined($conf->{cpuunits}) ?
             $conf->{cpuunits} : $defaults->{cpuunits};
+
+    if (defined($conf->{cpu_taskset})) {
+        push @$cmd, 'taskset', '-c', $conf->{cpu_taskset};
+    }
 
     push @$cmd, $kvm_binary;
 
