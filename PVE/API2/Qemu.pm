@@ -183,7 +183,12 @@ my $create_disks = sub {
 
 	    my $volid;
 	    if ($ds eq 'efidisk0') {
-		($volid, $size) = PVE::QemuServer::create_efidisk($storecfg, $storeid, $vmid, $fmt, $arch);
+		($volid, $size) = PVE::QemuServer::create_efidisk(
+		    $storecfg, $storeid, $vmid, $fmt, $arch, $disk);
+	    } elsif ($ds eq 'tpmstate0') {
+		# swtpm can only use raw volumes, and uses a fixed size
+		$size = PVE::Tools::convert_size(PVE::QemuServer::Drive::TPMSTATE_DISK_SIZE, 'b' => 'kb');
+		$volid = PVE::Storage::vdisk_alloc($storecfg, $storeid, $vmid, "raw", undef, $size);
 	    } else {
 		$volid = PVE::Storage::vdisk_alloc($storecfg, $storeid, $vmid, $fmt, undef, $size);
 	    }
@@ -4336,7 +4341,10 @@ __PACKAGE__->register_method({
 
 	},
     },
-    returns => { type => 'null'},
+    returns => {
+	type => 'string',
+	description => "the task ID.",
+    },
     code => sub {
 	my ($param) = @_;
 
@@ -4350,8 +4358,7 @@ __PACKAGE__->register_method({
 
 	my $disk = extract_param($param, 'disk');
 
-	my $updatefn =  sub {
-
+	my $load_and_check = sub {
 	    my $conf = PVE::QemuConfig->load_config($vmid);
 
 	    PVE::QemuConfig->check_lock($conf);
@@ -4365,18 +4372,23 @@ __PACKAGE__->register_method({
 	    die "you can't convert a VM to template if VM is running\n"
 		if PVE::QemuServer::check_running($vmid);
 
-	    my $realcmd = sub {
-		PVE::QemuServer::template_create($vmid, $conf, $disk);
-	    };
-
-	    $conf->{template} = 1;
-	    PVE::QemuConfig->write_config($vmid, $conf);
-
-	    return $rpcenv->fork_worker('qmtemplate', $vmid, $authuser, $realcmd);
+	    return $conf;
 	};
 
-	PVE::QemuConfig->lock_config($vmid, $updatefn);
-	return;
+	$load_and_check->();
+
+	my $realcmd = sub {
+	    PVE::QemuConfig->lock_config($vmid, sub {
+		my $conf = $load_and_check->();
+
+		$conf->{template} = 1;
+		PVE::QemuConfig->write_config($vmid, $conf);
+
+		PVE::QemuServer::template_create($vmid, $conf, $disk);
+	    });
+	};
+
+	return $rpcenv->fork_worker('qmtemplate', $vmid, $authuser, $realcmd);
     }});
 
 __PACKAGE__->register_method({

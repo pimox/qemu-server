@@ -63,18 +63,48 @@ eval {
 
 my $EDK2_FW_BASE = '/usr/share/pve-edk2-firmware/';
 my $OVMF = {
-    x86_64 => [
-	"$EDK2_FW_BASE/OVMF_CODE.fd",
-	"$EDK2_FW_BASE/OVMF_VARS.fd"
-    ],
-    aarch64 => [
-	"$EDK2_FW_BASE/AAVMF_CODE.fd",
-	"$EDK2_FW_BASE/AAVMF_VARS.fd"
-    ],
-    arm => [
-	"$EDK2_FW_BASE/AVMF_CODE.fd",
-	"$EDK2_FW_BASE/AVMF_VARS.fd"
-    ],
+    x86_64 => {
+	'4m' => [
+	    "$EDK2_FW_BASE/OVMF_CODE_4M.secboot.fd",
+	    "$EDK2_FW_BASE/OVMF_VARS_4M.fd",
+	],
+	'4m-ms' => [
+	    "$EDK2_FW_BASE/OVMF_CODE_4M.secboot.fd",
+	    "$EDK2_FW_BASE/OVMF_VARS_4M.ms.fd",
+	],
+	default => [
+	    "$EDK2_FW_BASE/OVMF_CODE.fd",
+	    "$EDK2_FW_BASE/OVMF_VARS.fd",
+	],
+    },
+    arm => {
+	'4m' => [
+	    "$EDK2_FW_BASE/AAVMF_CODE.fd",
+	    "$EDK2_FW_BASE/AAVMF_VARS.fd",
+	],
+	'4m-ms' => [
+	    "$EDK2_FW_BASE/AAVMF_CODE.fd",
+	    "$EDK2_FW_BASE/AAVMF_VARS.fd",
+	],
+	default => [
+	    "$EDK2_FW_BASE/AAVMF_CODE.fd",
+	    "$EDK2_FW_BASE/AAVMF_VARS.fd",
+	],
+    },
+    aarch64 => {
+	'4m' => [
+	    "$EDK2_FW_BASE/AAVMF_CODE.fd",
+	    "$EDK2_FW_BASE/AAVMF_VARS.fd",
+	],
+	'4m-ms' => [
+	    "$EDK2_FW_BASE/AAVMF_CODE.fd",
+	    "$EDK2_FW_BASE/AAVMF_VARS.fd",
+	],
+	default => [
+	    "$EDK2_FW_BASE/AAVMF_CODE.fd",
+	    "$EDK2_FW_BASE/AAVMF_VARS.fd",
+	],
+    },
 };
 
 my $cpuinfo = PVE::ProcFSTools::read_cpuinfo();
@@ -1147,7 +1177,8 @@ PVE::JSONSchema::register_format('pve-qm-bootdev', \&verify_bootdev);
 sub verify_bootdev {
     my ($dev, $noerr) = @_;
 
-    return $dev if PVE::QemuServer::Drive::is_valid_drivename($dev) && $dev !~ m/^efidisk/;
+    my $special = $dev =~ m/^efidisk/ || $dev =~ m/^tpmstate/;
+    return $dev if PVE::QemuServer::Drive::is_valid_drivename($dev) && !$special;
 
     my $check = sub {
 	my ($base) = @_;
@@ -2176,16 +2207,19 @@ sub destroy_vm {
 	});
     }
 
+    my $volids = {};
     my $remove_owned_drive = sub {
 	my ($ds, $drive) = @_;
  	return if drive_is_cdrom($drive, 1);
 
 	my $volid = $drive->{file};
 	return if !$volid || $volid =~ m|^/|;
+	return if $volids->{$volid};
 
 	my ($path, $owner) = PVE::Storage::path($storecfg, $volid);
 	return if !$path || !$owner || ($owner != $vmid);
 
+	$volids->{$volid} = 1;
 	eval { PVE::Storage::vdisk_free($storecfg, $volid) };
 	warn "Could not remove disk '$volid', check manually: $@" if $@;
     };
@@ -2203,6 +2237,8 @@ sub destroy_vm {
 	next if !defined($drive);
 	$remove_owned_drive->('vmstate', $drive);
     }
+
+    PVE::QemuConfig->foreach_volume_full($conf->{pending}, $include_opts, $remove_owned_drive);
 
     if ($purge_unreferenced) { # also remove unreferenced disk
 	my $vmdisks = PVE::Storage::vdisk_list($storecfg, undef, $vmid, undef, 'images');
@@ -2965,6 +3001,90 @@ sub audio_devs {
     return $devs;
 }
 
+sub get_tpm_paths {
+    my ($vmid) = @_;
+    return {
+	socket => "/var/run/qemu-server/$vmid.swtpm",
+	pid => "/var/run/qemu-server/$vmid.swtpm.pid",
+    };
+}
+
+sub add_tpm_device {
+    my ($vmid, $devices, $conf) = @_;
+
+    return if !$conf->{tpmstate0};
+
+    my $paths = get_tpm_paths($vmid);
+
+    push @$devices, "-chardev", "socket,id=tpmchar,path=$paths->{socket}";
+    push @$devices, "-tpmdev", "emulator,id=tpmdev,chardev=tpmchar";
+    push @$devices, "-device", "tpm-tis,tpmdev=tpmdev";
+}
+
+sub start_swtpm {
+    my ($storecfg, $vmid, $tpmdrive, $migration) = @_;
+
+    return if !$tpmdrive;
+
+    my $state;
+    my $tpm = parse_drive("tpmstate0", $tpmdrive);
+    my ($storeid, $volname) = PVE::Storage::parse_volume_id($tpm->{file}, 1);
+    if ($storeid) {
+	$state = PVE::Storage::map_volume($storecfg, $tpm->{file});
+    } else {
+	$state = $tpm->{file};
+    }
+
+    my $paths = get_tpm_paths($vmid);
+
+    # during migration, we will get state from remote
+    #
+    if (!$migration) {
+	# run swtpm_setup to create a new TPM state if it doesn't exist yet
+	my $setup_cmd = [
+	    "swtpm_setup",
+	    "--tpmstate",
+	    "file://$state",
+	    "--createek",
+	    "--create-ek-cert",
+	    "--create-platform-cert",
+	    "--lock-nvram",
+	    "--config",
+	    "/etc/swtpm_setup.conf", # do not use XDG configs
+	    "--runas",
+	    "0", # force creation as root, error if not possible
+	    "--not-overwrite", # ignore existing state, do not modify
+	];
+
+	push @$setup_cmd, "--tpm2" if $tpm->{version} eq 'v2.0';
+	# TPM 2.0 supports ECC crypto, use if possible
+	push @$setup_cmd, "--ecc" if $tpm->{version} eq 'v2.0';
+
+	run_command($setup_cmd, outfunc => sub {
+	    print "swtpm_setup: $1\n";
+	});
+    }
+
+    my $emulator_cmd = [
+	"swtpm",
+	"socket",
+	"--tpmstate",
+	"backend-uri=file://$state,mode=0600",
+	"--ctrl",
+	"type=unixio,path=$paths->{socket},mode=0600",
+	"--pid",
+	"file=$paths->{pid}",
+	"--terminate", # terminate on QEMU disconnect
+	"--daemon",
+    ];
+    push @$emulator_cmd, "--tpm2" if $tpm->{version} eq 'v2.0';
+    run_command($emulator_cmd, outfunc => sub { print $1; });
+
+    # return untainted PID of swtpm daemon so it can be killed on error
+    file_read_firstline($paths->{pid}) =~ m/(\d+)/;
+    return $1;
+}
+
 sub vga_conf_has_spice {
     my ($vga) = @_;
 
@@ -3055,13 +3175,18 @@ sub get_vm_machine {
     return $machine;
 }
 
-sub get_ovmf_files($) {
-    my ($arch) = @_;
+sub get_ovmf_files($$) {
+    my ($arch, $efidisk) = @_;
 
-    my $ovmf = $OVMF->{$arch}
+    my $types = $OVMF->{$arch}
 	or die "no OVMF images known for architecture '$arch'\n";
 
-    return @$ovmf;
+    my $type = 'default';
+    if (defined($efidisk->{efitype}) && $efidisk->{efitype} eq '4m') {
+	$type = $efidisk->{'pre-enrolled-keys'} ? "4m-ms" : "4m";
+    }
+
+    return $types->{$type}->@*;
 }
 
 my $Arch2Qemu = {
@@ -3321,13 +3446,17 @@ sub config_to_command {
     }
 
     if ($conf->{bios} && $conf->{bios} eq 'ovmf') {
-	my ($ovmf_code, $ovmf_vars) = get_ovmf_files($arch);
+	my $d;
+	if (my $efidisk = $conf->{efidisk0}) {
+	    $d = parse_drive('efidisk0', $efidisk);
+	}
+
+	my ($ovmf_code, $ovmf_vars) = get_ovmf_files($arch, $d);
 	die "uefi base image '$ovmf_code' not found\n" if ! -f $ovmf_code;
 
 	my ($path, $format);
 	my $read_only_str = '';
-	if (my $efidisk = $conf->{efidisk0}) {
-	    my $d = parse_drive('efidisk0', $efidisk);
+	if ($d) {
 	    my ($storeid, $volname) = PVE::Storage::parse_volume_id($d->{file}, 1);
 	    $format = $d->{format};
 	    if ($storeid) {
@@ -3469,6 +3598,8 @@ sub config_to_command {
 	my $audio_devs = audio_devs($audio, $audiopciaddr, $machine_version);
 	push @$devices, @$audio_devs;
     }
+
+    add_tpm_device($vmid, $devices, $conf);
 
     my $sockets = 1;
     $sockets = $conf->{smp} if $conf->{smp}; # old style - no longer iused
@@ -3666,6 +3797,8 @@ sub config_to_command {
 
 	# ignore efidisk here, already added in bios/fw handling code above
 	return if $drive->{interface} eq 'efidisk';
+	# similar for TPM
+	return if $drive->{interface} eq 'tpmstate';
 
 	$use_virtio = 1 if $ds =~ m/^virtio/;
 
@@ -4034,42 +4167,36 @@ sub vm_deviceunplug {
     die "can't unplug bootdisk '$deviceid'\n" if grep {$_ eq $deviceid} @$bootdisks;
 
     if ($deviceid eq 'tablet' || $deviceid eq 'keyboard') {
-
 	qemu_devicedel($vmid, $deviceid);
-
     } elsif ($deviceid =~ m/^usb\d+$/) {
-
 	die "usb hotplug currently not reliable\n";
 	# when unplugging usb devices this way, there may be remaining usb
 	# controllers/hubs so we disable it for now
 	#qemu_devicedel($vmid, $deviceid);
 	#qemu_devicedelverify($vmid, $deviceid);
-
     } elsif ($deviceid =~ m/^(virtio)(\d+)$/) {
-
-        qemu_devicedel($vmid, $deviceid);
-        qemu_devicedelverify($vmid, $deviceid);
-        qemu_drivedel($vmid, $deviceid);
-	qemu_iothread_del($conf, $vmid, $deviceid);
-
-    } elsif ($deviceid =~ m/^(virtioscsi|scsihw)(\d+)$/) {
+	my $device = parse_drive($deviceid, $conf->{$deviceid});
 
 	qemu_devicedel($vmid, $deviceid);
 	qemu_devicedelverify($vmid, $deviceid);
-	qemu_iothread_del($conf, $vmid, $deviceid);
-
+	qemu_drivedel($vmid, $deviceid);
+	qemu_iothread_del($vmid, $deviceid, $device);
+    } elsif ($deviceid =~ m/^(virtioscsi|scsihw)(\d+)$/) {
+	qemu_devicedel($vmid, $deviceid);
+	qemu_devicedelverify($vmid, $deviceid);
     } elsif ($deviceid =~ m/^(scsi)(\d+)$/) {
+	my $device = parse_drive($deviceid, $conf->{$deviceid});
 
-        qemu_devicedel($vmid, $deviceid);
-        qemu_drivedel($vmid, $deviceid);
+	qemu_devicedel($vmid, $deviceid);
+	qemu_drivedel($vmid, $deviceid);
 	qemu_deletescsihw($conf, $vmid, $deviceid);
 
+	qemu_iothread_del($vmid, "virtioscsi$device->{index}", $device)
+	    if $conf->{scsihw} && ($conf->{scsihw} eq 'virtio-scsi-single');
     } elsif ($deviceid =~ m/^(net)(\d+)$/) {
-
-        qemu_devicedel($vmid, $deviceid);
-        qemu_devicedelverify($vmid, $deviceid);
-        qemu_netdevdel($vmid, $deviceid);
-
+	qemu_devicedel($vmid, $deviceid);
+	qemu_devicedelverify($vmid, $deviceid);
+	qemu_netdevdel($vmid, $deviceid);
     } else {
 	die "can't unplug device '$deviceid'\n";
     }
@@ -4093,7 +4220,7 @@ sub qemu_devicedel {
 }
 
 sub qemu_iothread_add {
-    my($vmid, $deviceid, $device) = @_;
+    my ($vmid, $deviceid, $device) = @_;
 
     if ($device->{iothread}) {
 	my $iothreads = vm_iothreads_list($vmid);
@@ -4102,13 +4229,8 @@ sub qemu_iothread_add {
 }
 
 sub qemu_iothread_del {
-    my($conf, $vmid, $deviceid) = @_;
+    my ($vmid, $deviceid, $device) = @_;
 
-    my $confid = $deviceid;
-    if ($deviceid =~ m/^(?:virtioscsi|scsihw)(\d+)$/) {
-	$confid = 'scsi' . $1;
-    }
-    my $device = parse_drive($confid, $conf->{$confid});
     if ($device->{iothread}) {
 	my $iothreads = vm_iothreads_list($vmid);
 	qemu_objectdel($vmid, "iothread-$deviceid") if $iothreads->{"iothread-$deviceid"};
@@ -4116,7 +4238,7 @@ sub qemu_iothread_del {
 }
 
 sub qemu_objectadd {
-    my($vmid, $objectid, $qomtype) = @_;
+    my ($vmid, $objectid, $qomtype) = @_;
 
     mon_cmd($vmid, "object-add", id => $objectid, "qom-type" => $qomtype);
 
@@ -4124,7 +4246,7 @@ sub qemu_objectadd {
 }
 
 sub qemu_objectdel {
-    my($vmid, $objectid) = @_;
+    my ($vmid, $objectid) = @_;
 
     mon_cmd($vmid, "object-del", id => $objectid);
 
@@ -4147,7 +4269,7 @@ sub qemu_driveadd {
 }
 
 sub qemu_drivedel {
-    my($vmid, $deviceid) = @_;
+    my ($vmid, $deviceid) = @_;
 
     my $ret = PVE::QemuServer::Monitor::hmp_cmd($vmid, "drive_del drive-$deviceid");
     $ret =~ s/^\s+//;
@@ -4196,7 +4318,7 @@ sub qemu_findorcreatescsihw {
     my $scsihwid="$controller_prefix$controller";
     my $devices_list = vm_devices_list($vmid);
 
-    if(!defined($devices_list->{$scsihwid})) {
+    if (!defined($devices_list->{$scsihwid})) {
 	vm_deviceplug($storecfg, $conf, $vmid, $scsihwid, $device, $arch, $machine_type);
     }
 
@@ -4219,7 +4341,7 @@ sub qemu_deletescsihw {
     foreach my $opt (keys %{$devices_list}) {
 	if (is_valid_drivename($opt)) {
 	    my $drive = parse_drive($opt, $conf->{$opt});
-	    if($drive->{interface} eq 'scsi' && $drive->{index} < (($maxdev-1)*($controller+1))) {
+	    if ($drive->{interface} eq 'scsi' && $drive->{index} < (($maxdev-1)*($controller+1))) {
 		return 1;
 	    }
 	}
@@ -4538,6 +4660,9 @@ sub foreach_volid {
 	$volhash->{$volid}->{is_vmstate} //= 0;
 	$volhash->{$volid}->{is_vmstate} = 1 if $key eq 'vmstate';
 
+	$volhash->{$volid}->{is_tpmstate} //= 0;
+	$volhash->{$volid}->{is_tpmstate} = 1 if $key eq 'tpmstate0';
+
 	$volhash->{$volid}->{is_unused} //= 0;
 	$volhash->{$volid}->{is_unused} = 1 if $key =~ /^unused\d+$/;
 
@@ -4735,7 +4860,7 @@ sub vmconfig_hotplug_pending {
 		vmconfig_update_net($storecfg, $conf, $hotplug_features->{network},
 				    $vmid, $opt, $value, $arch, $machine_type);
 	    } elsif (is_valid_drivename($opt)) {
-		die "skip\n" if $opt eq 'efidisk0';
+		die "skip\n" if $opt eq 'efidisk0' || $opt eq 'tpmstate0';
 		# some changes can be done without hotplug
 		my $drive = parse_drive($opt, $value);
 		if (drive_is_cloudinit($drive)) {
@@ -5355,8 +5480,18 @@ sub vm_start_nolock {
 	PVE::Tools::run_fork sub {
 	    PVE::Systemd::enter_systemd_scope($vmid, "Proxmox VE VM $vmid", %properties);
 
+	    my $tpmpid;
+	    if (my $tpm = $conf->{tpmstate0}) {
+		# start the TPM emulator so QEMU can connect on start
+		$tpmpid = start_swtpm($storecfg, $vmid, $tpm, $migratedfrom);
+	    }
+
 	    my $exitcode = run_command($cmd, %run_params);
-	    die "QEMU exited with code $exitcode\n" if $exitcode;
+	    if ($exitcode) {
+		warn "stopping swtpm instance (pid $tpmpid) due to QEMU startup error\n";
+		kill 'TERM', $tpmpid if $tpmpid;
+		die "QEMU exited with code $exitcode\n";
+	    }
 	};
     };
 
@@ -5556,6 +5691,14 @@ sub vm_stop_cleanup {
 	if (!$keepActive) {
 	    my $vollist = get_vm_volumes($conf);
 	    PVE::Storage::deactivate_volumes($storecfg, $vollist);
+
+	    if (my $tpmdrive = $conf->{tpmstate0}) {
+		my $tpm = parse_drive("tpmstate0", $tpmdrive);
+		my ($storeid, $volname) = PVE::Storage::parse_volume_id($tpm->{file}, 1);
+		if ($storeid) {
+		    PVE::Storage::unmap_volume($storecfg, $tpm->{file});
+		}
+	    }
 	}
 
 	foreach my $ext (qw(mon qmp pid vnc qga)) {
@@ -6093,7 +6236,7 @@ sub restore_update_config_line {
 	$net->{macaddr} = PVE::Tools::random_ether_addr($dc->{mac_prefix}) if $net->{macaddr};
 	$netstr = print_net($net);
 	$res .= "$id: $netstr\n";
-    } elsif ($line =~ m/^((ide|scsi|virtio|sata|efidisk)\d+):\s*(\S+)\s*$/) {
+    } elsif ($line =~ m/^((ide|scsi|virtio|sata|efidisk|tpmstate)\d+):\s*(\S+)\s*$/) {
 	my $virtdev = $1;
 	my $value = $3;
 	my $di = parse_drive($virtdev, $value);
@@ -6411,8 +6554,8 @@ sub restore_proxmox_backup_archive {
 	    my $volid = $d->{volid};
 	    my $path = PVE::Storage::path($storecfg, $volid);
 
-	    # for live-restore we only want to preload the efidisk
-	    next if $options->{live} && $virtdev ne 'efidisk0';
+	    # for live-restore we only want to preload the efidisk and TPM state
+	    next if $options->{live} && $virtdev ne 'efidisk0' && $virtdev ne 'tpmstate0';
 
 	    my $pbs_restore_cmd = [
 		'/usr/bin/pbs-restore',
@@ -6487,7 +6630,9 @@ sub restore_proxmox_backup_archive {
 	my $conf = PVE::QemuConfig->load_config($vmid);
 	die "cannot do live-restore for template\n" if PVE::QemuConfig->is_template($conf);
 
-	delete $devinfo->{'drive-efidisk0'}; # this special drive is already restored before start
+	# these special drives are already restored before start
+	delete $devinfo->{'drive-efidisk0'};
+	delete $devinfo->{'drive-tpmstate0-backup'};
 	pbs_live_restore($vmid, $conf, $storecfg, $devinfo, $repo, $keyfile, $pbs_backup_name);
 
 	PVE::QemuConfig->remove_lock($vmid, "create");
@@ -7321,6 +7466,8 @@ sub clone_disk {
 	    $size = PVE::QemuServer::Cloudinit::CLOUDINIT_DISK_SIZE;
 	} elsif ($drivename eq 'efidisk0') {
 	    $size = get_efivars_size($conf);
+	} elsif ($drivename eq 'tpmstate0') {
+	    $size = PVE::QemuServer::Drive::TPMSTATE_DISK_SIZE;
 	} else {
 	    ($size) = PVE::Storage::volume_size_info($storecfg, $drive->{file}, 10);
 	}
@@ -7360,6 +7507,8 @@ sub clone_disk {
 		qemu_img_convert($drive->{file}, $newvolid, $size, $snapname, $sparseinit);
 	    }
 	} else {
+
+	    die "cannot move TPM state while VM is running\n" if $drivename eq 'tpmstate0';
 
 	    my $kvmver = get_running_qemu_version ($vmid);
 	    if (!min_version($kvmver, 2, 7)) {
@@ -7414,7 +7563,8 @@ sub qemu_use_old_bios_files {
 sub get_efivars_size {
     my ($conf) = @_;
     my $arch = get_vm_arch($conf);
-    my (undef, $ovmf_vars) = get_ovmf_files($arch);
+    my $efidisk = $conf->{efidisk0} ? parse_drive('efidisk0', $conf->{efidisk0}) : undef;
+    my (undef, $ovmf_vars) = get_ovmf_files($arch, $efidisk);
     die "uefi vars image '$ovmf_vars' not found\n" if ! -f $ovmf_vars;
     return -s $ovmf_vars;
 }
@@ -7431,10 +7581,18 @@ sub update_efidisk_size {
     return;
 }
 
-sub create_efidisk($$$$$) {
-    my ($storecfg, $storeid, $vmid, $fmt, $arch) = @_;
+sub update_tpmstate_size {
+    my ($conf) = @_;
 
-    my (undef, $ovmf_vars) = get_ovmf_files($arch);
+    my $disk = PVE::QemuServer::parse_drive('tpmstate0', $conf->{tpmstate0});
+    $disk->{size} = PVE::QemuServer::Drive::TPMSTATE_DISK_SIZE;
+    $conf->{tpmstate0} = print_drive($disk);
+}
+
+sub create_efidisk($$$$$$) {
+    my ($storecfg, $storeid, $vmid, $fmt, $arch, $efidisk) = @_;
+
+    my (undef, $ovmf_vars) = get_ovmf_files($arch, $efidisk);
     die "EFI vars default image not found\n" if ! -f $ovmf_vars;
 
     my $vars_size_b = -s $ovmf_vars;

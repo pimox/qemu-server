@@ -337,14 +337,15 @@ sub prepare {
 	my ($sid, $volname) = PVE::Storage::parse_volume_id($volid, 1);
 
 	# check if storage is available on both nodes
-	my $targetsid = PVE::QemuServer::map_storage($self->{opts}->{storagemap}, $sid);
-
 	my $scfg = PVE::Storage::storage_check_enabled($storecfg, $sid);
-	my $target_scfg = PVE::Storage::storage_check_enabled(
-	    $storecfg,
-	    $targetsid,
-	    $self->{node},
-	);
+
+	my $targetsid = $sid;
+	# NOTE: we currently ignore shared source storages in mappings so skip here too for now
+	if (!$scfg->{shared}) {
+	    $targetsid = PVE::QemuServer::map_storage($self->{opts}->{storagemap}, $sid);
+	}
+
+	my $target_scfg = PVE::Storage::storage_check_enabled($storecfg, $targetsid, $self->{node});
 	my ($vtype) = PVE::Storage::parse_volname($storecfg, $volid);
 
 	die "$volid: content type '$vtype' is not available on storage '$targetsid'\n"
@@ -472,15 +473,22 @@ sub scan_local_volumes {
 
 	    my ($sid, $volname) = PVE::Storage::parse_volume_id($volid);
 
-	    my $targetsid = PVE::QemuServer::map_storage($self->{opts}->{storagemap}, $sid);
 	    # check if storage is available on both nodes
 	    my $scfg = PVE::Storage::storage_check_enabled($storecfg, $sid);
+
+	    my $targetsid = $sid;
+	    # NOTE: we currently ignore shared source storages in mappings so skip here too for now
+	    if (!$scfg->{shared}) {
+		$targetsid = PVE::QemuServer::map_storage($self->{opts}->{storagemap}, $sid);
+	    }
+
 	    PVE::Storage::storage_check_enabled($storecfg, $targetsid, $self->{node});
 
 	    return if $scfg->{shared};
 
 	    $local_volumes->{$volid}->{ref} = $attr->{referenced_in_config} ? 'config' : 'snapshot';
 	    $local_volumes->{$volid}->{ref} = 'storage' if $attr->{is_unused};
+	    $local_volumes->{$volid}->{ref} = 'generated' if $attr->{is_tpmstate};
 
 	    $local_volumes->{$volid}->{is_vmstate} = $attr->{is_vmstate} ? 1 : 0;
 
@@ -580,6 +588,9 @@ sub scan_local_volumes {
 		$local_volumes->{$volid}->{migration_mode} = 'online';
 	    } elsif ($self->{running} && $ref eq 'generated') {
 		# offline migrate the cloud-init ISO and don't regenerate on VM start
+		#
+		# tpmstate will also be offline migrated first, and in case of
+		# live migration then updated by QEMU/swtpm if necessary
 		$local_volumes->{$volid}->{migration_mode} = 'offline';
 	    } else {
 		$local_volumes->{$volid}->{migration_mode} = 'offline';
@@ -641,7 +652,9 @@ sub config_update_local_disksizes {
 
     PVE::QemuConfig->foreach_volume($conf, sub {
 	my ($key, $drive) = @_;
-	return if $key eq 'efidisk0'; # skip efidisk, will be handled later
+	# skip special disks, will be handled later
+	return if $key eq 'efidisk0';
+	return if $key eq 'tpmstate0';
 
 	my $volid = $drive->{file};
 	return if !defined($local_volumes->{$volid}); # only update sizes for local volumes
@@ -657,6 +670,12 @@ sub config_update_local_disksizes {
     # real OVMF_VARS.fd image, else we can create a too big image, which does not work
     if (defined($conf->{efidisk0})) {
 	PVE::QemuServer::update_efidisk_size($conf);
+    }
+
+    # TPM state might have an irregular filesize, to avoid problems on transfer
+    # we always assume the static size of 4M to allocate on the target
+    if (defined($conf->{tpmstate0})) {
+	PVE::QemuServer::update_tpmstate_size($conf);
     }
 }
 
